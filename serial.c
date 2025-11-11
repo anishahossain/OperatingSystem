@@ -1,16 +1,23 @@
 // Project 2 - Parallel Text Compression
 // Authors: Alina Pineda, Anisha Hossain, Brielle Ashmeade, Georgia Ng Wai
 // Description:
-// This program speeds up text compression by using POSIX threads
-// to compress multiple ".txt" files in parallel. Each thread
-// reads, compresses, and stores the data for one or more files,
-// while the main thread merges the results into a single output
-// file "text.tzip" in lexicographical order.
-
+// Parallelizes the compression of .txt files in a directory using pthreads.
+// Each worker thread pulls the next file index, reads it, compresses it,
+// and stores the result. The main thread then writes all compressed files
+// in lexicographical order to "text.tzip".
+//
 // Constraints:
-// - Only pthread library used (no other concurrency APIs)
-// - Max 20 threads total (main + workers)
-// - Output format matches the baseline serial implementation
+// - Only pthread library
+// - At most 20 threads total (main + workers)
+// - Output format must match the baseline (size + bytes per file)
+// Notes:
+// - This version focuses on simplicity and correctness.
+// - Each worker owns its own I/O buffers to avoid repeated allocation.
+// - The shared job index is protected by a mutex to ensure only one thread
+//   claims a given file at a time, which preserves correctness even though
+//   multiple threads are running.
+// - Final output order is preserved because we still write using the
+//   lexicographically sorted array of file names.
 
 #include <dirent.h>
 #include <stdio.h>
@@ -20,65 +27,66 @@
 #include <zlib.h>
 #include <pthread.h>
 
-#define BUFFER_SIZE 1048576      // 1MB buffer size for I/O and compression
-#define MAX_THREADS 20           // Max threads allowed (including main)
+#define BUFFER_SIZE 1048576      // 1 MB
+#define MAX_THREADS 20           // main + workers must stay <= 20
 
 // ---------- sorting helper ----------
-// Compare function for qsort to sort filenames lexicographically
+// qsort comparator: sorts C strings (file names) in ascending lexicographical order
 static int cmp(const void *a, const void *b) {
     return strcmp(*(char * const *) a, *(char * const *) b);
 }
 
 // ---------- job structure ----------
-// Represents a single compression task for one text file
+// Represents one file to compress and the data produced for it.
 typedef struct {
-    char  *full_path;            // Full file path (directory + filename)
-    unsigned char *compressed;   // Pointer to compressed data buffer
-    int compressed_size;         // Size of compressed data in bytes
-    int original_size;           // Size of uncompressed data in bytes
-    int done;                    // Flag indicating if compression is complete
+    char  *full_path;            // "dir/file.txt"
+    unsigned char *compressed;   // heap buffer holding compressed data
+    int compressed_size;         // how many bytes are valid
+    int original_size;           // bytes read from file
+    int done;                    // optional flag to mark completion
 } file_job_t;
 
-// ---------- global shared variables ----------
-// Shared job array and counters accessible by all threads
+// ---------- globals ----------
+// Array of jobs, kept in the same order as the sorted file list.
 static file_job_t *g_jobs = NULL;
 static int g_nfiles = 0;
-static pthread_mutex_t g_job_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_next_job = 0;       // Index of next file to process (shared counter)
 
-// Worker thread: Compresses files concurrently
-// Each thread repeatedly grabs the next available file index,
-// reads the file, compresses it, and stores the result.
+// Mutex + shared index to distribute work among threads.
+static pthread_mutex_t g_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_next_job = 0;
+
+// ---------- worker thread ----------
+// Each worker repeatedly claims the next available job, compresses that file,
+// and stores the result back into the corresponding job slot.
 static void *worker_thread(void *arg) {
     (void)arg;
 
-    // Allocate scratch buffers ONCE per thread to reduce malloc/free overhead
+    // allocate per-thread scratch buffers (so we don't malloc per file)
     unsigned char *buffer_in  = malloc(BUFFER_SIZE);
     unsigned char *buffer_out = malloc(BUFFER_SIZE);
     assert(buffer_in && buffer_out);
 
     for (;;) {
-        // --- Fetch the next available file index safely ---
+        // get a job index
         pthread_mutex_lock(&g_job_lock);
         int idx = g_next_job++;
         pthread_mutex_unlock(&g_job_lock);
 
-        // If no more files remain, exit loop
         if (idx >= g_nfiles)
             break;
 
         file_job_t *job = &g_jobs[idx];
 
-        // --- Read file into input buffer ---
+        // read file
         FILE *f_in = fopen(job->full_path, "rb");
         assert(f_in != NULL);
         int nbytes = (int)fread(buffer_in, 1, BUFFER_SIZE, f_in);
         fclose(f_in);
         job->original_size = nbytes;
 
-        // --- Compress the file using zlib ---
+        // compress into buffer_out
         z_stream strm;
-        int ret = deflateInit(&strm, 9);  // Level 9 = max compression
+        int ret = deflateInit(&strm, 9);      // use highest compression like starter
         assert(ret == Z_OK);
 
         strm.avail_in  = nbytes;
@@ -92,7 +100,7 @@ static void *worker_thread(void *arg) {
         int nbytes_zipped = (int)(BUFFER_SIZE - strm.avail_out);
         deflateEnd(&strm);
 
-        // --- Store result in job struct ---
+        // store result in a job-owned buffer
         unsigned char *out_copy = malloc(nbytes_zipped);
         assert(out_copy != NULL);
         memcpy(out_copy, buffer_out, nbytes_zipped);
@@ -102,29 +110,28 @@ static void *worker_thread(void *arg) {
         job->done            = 1;
     }
 
-    // Free per-thread buffers before exit
     free(buffer_in);
     free(buffer_out);
     return NULL;
 }
 
-// Main entry point: compress_directory()
-// Scans the directory, creates worker threads to compress files,
-// and writes all results into a single archive in order.
+// ---------- main entry ----------
+// Scans the directory for .txt files, sorts them, creates the job list,
+// starts worker threads, waits for them, and finally writes everything
+// to "text.tzip" in the same order as the sorted file names.
 int compress_directory(char *directory_name) {
     DIR *d;
     struct dirent *dir;
     char **files = NULL;
     int nfiles = 0;
 
-    // --- Open directory ---
     d = opendir(directory_name);
     if (d == NULL) {
         printf("An error has occurred\n");
         return 0;
     }
 
-    // --- Collect all .txt files ---
+    // collect txt files
     while ((dir = readdir(d)) != NULL) {
         int len = (int)strlen(dir->d_name);
         if (len >= 4 &&
@@ -133,6 +140,7 @@ int compress_directory(char *directory_name) {
             dir->d_name[len-2] == 'x' &&
             dir->d_name[len-1] == 't') {
 
+            // grow array of file names
             files = realloc(files, (nfiles + 1) * sizeof(char *));
             assert(files != NULL);
             files[nfiles] = strdup(dir->d_name);
@@ -142,10 +150,10 @@ int compress_directory(char *directory_name) {
     }
     closedir(d);
 
-    // --- Sort files lexicographically (required by spec) ---
+    // sort lexicographically
     qsort(files, nfiles, sizeof(char *), cmp);
 
-    // --- Initialize job list ---
+    // build job array
     g_jobs = malloc(nfiles * sizeof(file_job_t));
     assert(g_jobs != NULL);
     g_nfiles = nfiles;
@@ -154,7 +162,6 @@ int compress_directory(char *directory_name) {
         int len = (int)strlen(directory_name) + (int)strlen(files[i]) + 2;
         char *full_path = malloc(len);
         assert(full_path != NULL);
-
         strcpy(full_path, directory_name);
         strcat(full_path, "/");
         strcat(full_path, files[i]);
@@ -166,33 +173,34 @@ int compress_directory(char *directory_name) {
         g_jobs[i].done            = 0;
     }
 
-    // --- Decide how many threads to create ---
+    // decide number of threads: up to 19 workers + 1 main = 20 total
     int num_threads = nfiles;
-    if (num_threads > (MAX_THREADS - 1))    // 1 slot reserved for main
+    if (num_threads > (MAX_THREADS - 1))
         num_threads = MAX_THREADS - 1;
     if (num_threads < 1)
         num_threads = 1;
 
     pthread_t threads[MAX_THREADS];
 
-    // --- Create worker threads ---
+    // spawn workers
     for (int i = 0; i < num_threads; i++) {
         int rc = pthread_create(&threads[i], NULL, worker_thread, NULL);
         assert(rc == 0);
     }
 
-    // --- Wait for all workers to finish ---
+    // wait for workers
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    // --- Write compressed data in order to output file ---
+    // write final archive in order
     int total_in = 0;
     int total_out = 0;
     FILE *f_out = fopen("text.tzip", "wb");
     assert(f_out != NULL);
 
     for (int i = 0; i < nfiles; i++) {
+        // first write compressed size (int), then the actual compressed bytes
         fwrite(&g_jobs[i].compressed_size, sizeof(int), 1, f_out);
         fwrite(g_jobs[i].compressed, 1, g_jobs[i].compressed_size, f_out);
 
@@ -202,14 +210,14 @@ int compress_directory(char *directory_name) {
 
     fclose(f_out);
 
-    // --- Report compression performance ---
+    // print compression statistics
     if (total_in > 0)
         printf("Compression rate: %.2lf%%\n",
                100.0 * (total_in - total_out) / total_in);
     else
         printf("Compression rate: 0.00%%\n");
 
-    // --- Free all allocated memory ---
+    // cleanup
     for (int i = 0; i < nfiles; i++) {
         free(g_jobs[i].full_path);
         free(g_jobs[i].compressed);
